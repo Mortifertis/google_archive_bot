@@ -1,15 +1,23 @@
 """Tests for building DOCX documents from Telegram posts."""
 
+import base64
 from datetime import datetime, timezone
 
 from docx import Document
 
-from app.document_builder import (
-    MAX_TITLE_LENGTH,
-    build_document_title,
-    build_post_docx,
-)
+from app.document_builder import (MAX_TITLE_LENGTH, build_document_title,
+                                  build_post_docx)
+from app.telegram_media import DownloadedPhoto
 from app.telegram_parser import ForwardedPost
+
+PNG_DATA = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "/wcAAusB9Wl2nF0AAAAASUVORK5CYII="
+)
+
+
+def _photo(unique_id: str = "photo") -> DownloadedPhoto:
+    return DownloadedPhoto(PNG_DATA, 1, 1, unique_id)
 
 
 def _post(**changes: object) -> ForwardedPost:
@@ -63,3 +71,58 @@ def test_caption_is_used_when_text_is_missing() -> None:
     document = Document(build_post_docx(_post(text=None, caption="Подпись")))
 
     assert "Подпись" in [item.text for item in document.paragraphs]
+
+
+def test_single_photo_is_embedded() -> None:
+    document = Document(build_post_docx(_post(), [_photo()]))
+
+    assert len(document.inline_shapes) == 1
+    assert "Изображения" in [item.text for item in document.paragraphs]
+
+
+def test_three_photos_are_embedded_in_supplied_order() -> None:
+    photos = [_photo("first"), _photo("second"), _photo("third")]
+
+    document = Document(build_post_docx(_post(), photos))
+
+    assert [photo.file_unique_id for photo in photos] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert len(document.inline_shapes) == 3
+
+
+def test_text_only_document_has_no_images_section() -> None:
+    document = Document(build_post_docx(_post()))
+
+    assert len(document.inline_shapes) == 0
+    assert "Изображения" not in [item.text for item in document.paragraphs]
+
+
+def test_caption_and_photo_are_both_preserved() -> None:
+    caption = "Полная подпись\nсо второй строкой"
+    document = Document(
+        build_post_docx(
+            _post(text=None, caption=caption, photo_count=1),
+            [_photo()],
+        )
+    )
+
+    paragraphs = [item.text for item in document.paragraphs]
+    assert "Полная подпись" in paragraphs
+    assert "со второй строкой" in paragraphs
+    assert len(document.inline_shapes) == 1
+
+
+def test_photo_without_caption_builds_without_placeholder_text() -> None:
+    document = Document(
+        build_post_docx(
+            _post(text=None, caption=None, photo_count=1),
+            [_photo()],
+        )
+    )
+
+    paragraphs = [item.text for item in document.paragraphs]
+    assert len(document.inline_shapes) == 1
+    assert "Текст отсутствует" not in paragraphs

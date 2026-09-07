@@ -1,9 +1,11 @@
 """Build in-memory DOCX files for forwarded Telegram posts."""
 
+from collections.abc import Sequence
 from io import BytesIO
 
 from docx import Document
 
+from app.telegram_media import DownloadedPhoto
 from app.telegram_parser import ForwardedPost
 
 MAX_TITLE_LENGTH = 150
@@ -41,8 +43,15 @@ def build_document_title(post: ForwardedPost) -> str:
     return title[: MAX_TITLE_LENGTH - 1].rstrip() + "…"
 
 
-def build_post_docx(post: ForwardedPost) -> BytesIO:
-    """Return a seekable DOCX stream containing the complete post text."""
+class DocumentImageError(RuntimeError):
+    """A photo could not be embedded in the archive document."""
+
+
+def build_post_docx(
+    post: ForwardedPost,
+    photos: Sequence[DownloadedPhoto] = (),
+) -> BytesIO:
+    """Return a seekable DOCX stream containing post text and photos."""
     title = build_document_title(post)
     document = Document()
     document.add_heading(title, level=1)
@@ -60,8 +69,30 @@ def build_post_docx(post: ForwardedPost) -> BytesIO:
     document.add_paragraph(f"Оригинал: {post.source_url or 'недоступен'}")
     document.add_paragraph("—")
 
-    for paragraph in _post_content(post).split("\n"):
-        document.add_paragraph(paragraph)
+    content = _post_content(post)
+    if content:
+        for paragraph in content.split("\n"):
+            document.add_paragraph(paragraph)
+
+    if photos:
+        document.add_paragraph()
+        document.add_heading("Изображения", level=2)
+        section = document.sections[0]
+        available_width = (
+            section.page_width
+            - section.left_margin
+            - section.right_margin
+        )
+        try:
+            for photo in photos:
+                document.add_picture(
+                    BytesIO(photo.data),
+                    width=available_width,
+                )
+        except Exception as error:
+            raise DocumentImageError(
+                "Could not embed a Telegram photo in DOCX"
+            ) from error
 
     document.add_paragraph("Сохранено через Telegram Archive Bot")
     stream = BytesIO()

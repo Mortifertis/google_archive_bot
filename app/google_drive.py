@@ -1,6 +1,7 @@
 """Google OAuth and Drive helpers for the archive folder setup."""
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 from app.config import GoogleConfig
 from app.document_builder import build_document_title, build_post_docx
+from app.telegram_media import DownloadedPhoto
 from app.telegram_parser import ForwardedPost
 
 GOOGLE_DRIVE_SCOPES = [
@@ -254,6 +256,7 @@ def create_google_document(
 def archive_forwarded_post(
     post: ForwardedPost,
     google_config: GoogleConfig,
+    photos: Sequence[DownloadedPhoto] = (),
 ) -> DriveDocument:
     """Synchronously archive one post using a fresh Drive service."""
     credentials = get_google_credentials(
@@ -276,11 +279,13 @@ def archive_forwarded_post(
         properties["source_message_id"] = str(post.source_message_id)
     if post.media_group_id is not None:
         properties["media_group_id"] = str(post.media_group_id)
+    if photos:
+        properties["photo_count"] = str(len(photos))
 
     return create_google_document(
         drive_service,
         folder.id,
         build_document_title(post),
-        build_post_docx(post),
+        build_post_docx(post, photos),
         properties,
     )
