@@ -16,6 +16,38 @@ class Config:
     media_group_debounce_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class GoogleConfig:
+    """Settings used by the standalone Google authorization command."""
+
+    credentials_path: str
+    token_path: str
+    archive_folder_name: str
+
+
+def load_google_config() -> GoogleConfig:
+    """Load Google settings without requiring Telegram credentials."""
+    load_dotenv()
+
+    return GoogleConfig(
+        credentials_path=os.getenv(
+            "GOOGLE_CREDENTIALS_PATH",
+            "google_credentials.json",
+        ).strip()
+        or "google_credentials.json",
+        token_path=os.getenv(
+            "GOOGLE_TOKEN_PATH",
+            "google_token.json",
+        ).strip()
+        or "google_token.json",
+        archive_folder_name=os.getenv(
+            "GOOGLE_ARCHIVE_FOLDER_NAME",
+            "Telegram Archive",
+        ).strip()
+        or "Telegram Archive",
+    )
+
+
 def load_config() -> Config:
     """Load and validate settings from a local ``.env`` file."""
     load_dotenv()

@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.config import load_config
+from app.config import load_config, load_google_config
 
 
 def _required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -34,3 +34,15 @@ def test_invalid_media_group_debounce(
 
     with pytest.raises(ValueError, match="MEDIA_GROUP_DEBOUNCE_SECONDS"):
         load_config()
+
+
+def test_google_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GOOGLE_CREDENTIALS_PATH", raising=False)
+    monkeypatch.delenv("GOOGLE_TOKEN_PATH", raising=False)
+    monkeypatch.delenv("GOOGLE_ARCHIVE_FOLDER_NAME", raising=False)
+
+    config = load_google_config()
+
+    assert config.credentials_path == "google_credentials.json"
+    assert config.token_path == "google_token.json"
+    assert config.archive_folder_name == "Telegram Archive"
