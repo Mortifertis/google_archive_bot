@@ -52,6 +52,7 @@ def test_public_channel_forward() -> None:
         tz=timezone.utc,
     )
     assert post.text == "Forwarded text"
+    assert post.photo_count == 0
 
 
 def test_channel_forward_without_username() -> None:
@@ -64,6 +65,23 @@ def test_channel_forward_without_username() -> None:
     assert post is not None
     assert post.source_chat_username is None
     assert post.source_url is None
+
+
+def test_single_photo_is_counted_once() -> None:
+    payload = _message_payload()
+    payload.pop("text")
+    payload["caption"] = "Photo caption"
+    payload["photo"] = [
+        {"file_id": "small", "file_unique_id": "same"},
+        {"file_id": "large", "file_unique_id": "same"},
+    ]
+
+    post = parse_forwarded_post(Message.model_validate(payload))
+
+    assert post is not None
+    assert post.photo_count == 1
+    assert post.text == "Photo caption"
+    assert post.caption == "Photo caption"
 
 
 def test_regular_message_returns_none() -> None:
