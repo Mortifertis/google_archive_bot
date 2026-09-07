@@ -8,21 +8,21 @@ from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.config import GoogleConfig
+from app.document_builder import DocumentImageError
 from app.google_drive import GoogleAuthError, archive_forwarded_post
-from app.media_group import MediaGroupCollector
-from app.telegram_parser import (
-    ForwardedPost,
-    parse_forwarded_messages,
-    parse_forwarded_post,
-)
+from app.media_group import MediaGroupCollector, is_photo_album
+from app.telegram_media import (DownloadedPhoto, TelegramMediaError,
+                                download_message_photo)
+from app.telegram_parser import (ForwardedPost, parse_forwarded_messages,
+                                 parse_forwarded_post)
 
 logger = logging.getLogger(__name__)
 
 START_MESSAGE = (
     "Telegram Archive Bot работает.\n\n"
-    "Перешли сюда текстовый пост из Telegram-канала — я сохраню "
+    "Перешли сюда пост из Telegram-канала — я сохраню "
     "его в Google Drive как Google Doc.\n\n"
-    "Посты с изображениями добавим следующим этапом."
+    "Поддерживаются текст, фотографии и фотоальбомы."
 )
 RECEIVED_MESSAGE = (
     "Сообщение получено.\n" "Для архивации перешли пост из Telegram-канала."
@@ -36,10 +36,22 @@ UNSUPPORTED_ALBUM_MESSAGE = (
     "Получен альбом, но сейчас поддерживаются только пересланные "
     "публикации из Telegram-каналов."
 )
-PHOTO_MESSAGE = (
-    "Пост распознан, но содержит изображение.\n\n"
-    "Сохранение постов с изображениями будет добавлено на следующем "
-    "этапе."
+MIXED_ALBUM_MESSAGE = (
+    "Альбом содержит неподдерживаемые типы медиа.\n\n"
+    "Сейчас можно сохранять только альбомы, состоящие полностью из "
+    "фотографий."
+)
+PHOTO_DOWNLOAD_ERROR_MESSAGE = (
+    "❌ Не удалось скачать изображение из публикации.\n\n"
+    "Попробуй переслать публикацию ещё раз."
+)
+ALBUM_DOWNLOAD_ERROR_MESSAGE = (
+    "❌ Не удалось скачать одно из изображений альбома.\n\n"
+    "Попробуй переслать публикацию ещё раз."
+)
+IMAGE_SAVE_ERROR_MESSAGE = (
+    "❌ Не удалось сохранить изображение из публикации.\n\n"
+    "Подробности записаны в журнал."
 )
 GOOGLE_AUTH_MESSAGE = (
     "❌ Google Drive не настроен.\n\n"
@@ -83,6 +95,19 @@ def _format_forwarded_post(post: ForwardedPost) -> str:
     )
 
 
+def _document_keyboard(web_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Открыть Google Doc",
+                    url=web_url,
+                )
+            ]
+        ]
+    )
+
+
 def create_router(
     owner_user_id: int,
     media_group_collector: MediaGroupCollector,
@@ -114,14 +139,57 @@ def create_router(
             if post is None or not post.is_channel_post:
                 await messages[0].answer(UNSUPPORTED_ALBUM_MESSAGE)
                 return
-            if post.photo_count:
-                await messages[0].answer(
-                    f"Альбом распознан: {post.photo_count} фото.\n\n"
-                    "Сохранение постов с изображениями будет добавлено "
-                    "на следующем этапе."
-                )
+            if not is_photo_album(messages):
+                await messages[0].answer(MIXED_ALBUM_MESSAGE)
                 return
-            await messages[0].answer(UNSUPPORTED_ALBUM_MESSAGE)
+
+            status = await messages[0].answer(
+                f"⏳ Сохраняю альбом из {len(messages)} фото…"
+            )
+            photos: list[DownloadedPhoto] = []
+            try:
+                for item in messages:
+                    photos.append(
+                        await download_message_photo(item.bot, item)
+                    )
+            except TelegramMediaError:
+                logger.exception("Could not download Telegram photo album")
+                await status.edit_text(ALBUM_DOWNLOAD_ERROR_MESSAGE)
+                return
+
+            try:
+                document = await asyncio.to_thread(
+                    archive_forwarded_post,
+                    post,
+                    google_config,
+                    photos,
+                )
+            except GoogleAuthError:
+                await status.edit_text(GOOGLE_AUTH_MESSAGE)
+                return
+            except DocumentImageError:
+                logger.exception("Could not add album image to DOCX")
+                await status.edit_text(IMAGE_SAVE_ERROR_MESSAGE)
+                return
+            except Exception:
+                logger.exception("Could not archive Telegram photo album")
+                await status.edit_text(GOOGLE_ERROR_MESSAGE)
+                return
+
+            logger.info(
+                "Telegram photo album archived: media_group_id=%s, "
+                "photos=%s",
+                post.media_group_id,
+                len(photos),
+            )
+            channel_title = post.source_chat_title or "недоступен"
+            await status.edit_text(
+                "✅ Сохранено\n\n"
+                f"📄 {document.name}\n"
+                f"📢 {channel_title}\n"
+                f"🖼 Фото: {len(photos)}",
+                reply_markup=_document_keyboard(document.web_url),
+            )
 
         await media_group_collector.add(message, process_album)
 
@@ -139,22 +207,39 @@ def create_router(
             post.source_message_id,
             post.media_group_id,
         )
-        if post.photo_count:
-            await message.answer(PHOTO_MESSAGE)
-            return
-        if message.content_type != "text" or not (post.text or post.caption):
+        if not post.photo_count and (
+            message.content_type != "text" or not post.text
+        ):
             await message.answer(_format_forwarded_post(post))
             return
 
-        status = await message.answer("⏳ Сохраняю в Google Drive…")
+        photos: list[DownloadedPhoto] = []
+        if post.photo_count:
+            status = await message.answer("⏳ Загружаю изображение…")
+            try:
+                photos.append(
+                    await download_message_photo(message.bot, message)
+                )
+            except TelegramMediaError:
+                logger.exception("Could not download Telegram post photo")
+                await status.edit_text(PHOTO_DOWNLOAD_ERROR_MESSAGE)
+                return
+            await status.edit_text("⏳ Сохраняю в Google Drive…")
+        else:
+            status = await message.answer("⏳ Сохраняю в Google Drive…")
         try:
             document = await asyncio.to_thread(
                 archive_forwarded_post,
                 post,
                 google_config,
+                photos,
             )
         except GoogleAuthError:
             await status.edit_text(GOOGLE_AUTH_MESSAGE)
+            return
+        except DocumentImageError:
+            logger.exception("Could not add post image to DOCX")
+            await status.edit_text(IMAGE_SAVE_ERROR_MESSAGE)
             return
         except Exception:
             logger.exception("Could not archive forwarded Telegram post")
@@ -162,19 +247,14 @@ def create_router(
             return
 
         channel_title = post.source_chat_title or "недоступен"
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Открыть Google Doc",
-                        url=document.web_url,
-                    )
-                ]
-            ]
+        logger.info(
+            "Forwarded Telegram post archived: message_id=%s, photos=%s",
+            post.source_message_id,
+            len(photos),
         )
         await status.edit_text(
             "✅ Сохранено\n\n" f"📄 {document.name}\n" f"📢 {channel_title}",
-            reply_markup=keyboard,
+            reply_markup=_document_keyboard(document.web_url),
         )
 
     @router.message(F.from_user.id == owner_user_id)

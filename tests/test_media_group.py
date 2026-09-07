@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from aiogram.types import Message
 
-from app.media_group import MediaGroupCollector
+from app.media_group import MediaGroupCollector, is_photo_album
 from app.telegram_parser import parse_forwarded_messages
 
 
@@ -60,6 +60,29 @@ def _message(
     if caption is not None:
         payload["caption"] = caption
     return Message.model_validate(payload)
+
+
+def test_photo_album_is_supported() -> None:
+    messages = [_message(item, photo=True) for item in range(1, 4)]
+
+    assert is_photo_album(messages) is True
+
+
+def test_mixed_media_album_is_not_supported() -> None:
+    messages = [_message(1, photo=True), _message(2, photo=True)]
+    video = _message(3).model_copy(
+        update={
+            "video": {
+                "file_id": "video",
+                "file_unique_id": "unique-video",
+                "width": 800,
+                "height": 600,
+                "duration": 1,
+            }
+        }
+    )
+
+    assert is_photo_album([*messages, video]) is False
 
 
 @async_test

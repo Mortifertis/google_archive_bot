@@ -2,11 +2,8 @@
 
 from unittest.mock import MagicMock
 
-from app.google_drive import (
-    ARCHIVE_APP_PROPERTIES,
-    FOLDER_MIME_TYPE,
-    ensure_archive_folder,
-)
+from app.google_drive import (ARCHIVE_APP_PROPERTIES, FOLDER_MIME_TYPE,
+                              ensure_archive_folder)
 
 
 def _drive_service(list_responses: list[dict[str, object]]) -> MagicMock:
@@ -116,11 +113,8 @@ def test_oldest_duplicate_archive_folder_is_selected() -> None:
 def test_google_document_is_imported_with_metadata() -> None:
     from io import BytesIO
 
-    from app.google_drive import (
-        DOCX_MIME_TYPE,
-        GOOGLE_DOC_MIME_TYPE,
-        create_google_document,
-    )
+    from app.google_drive import (DOCX_MIME_TYPE, GOOGLE_DOC_MIME_TYPE,
+                                  create_google_document)
 
     service = MagicMock()
     service.files.return_value.create.return_value.execute.return_value = {

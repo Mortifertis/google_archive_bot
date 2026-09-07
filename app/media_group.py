@@ -11,6 +11,11 @@ MediaGroupCallback = Callable[[list[Message]], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
 
+def is_photo_album(messages: list[Message]) -> bool:
+    """Return whether every collected album item is a photo."""
+    return bool(messages) and all(bool(message.photo) for message in messages)
+
+
 class MediaGroupCollector:
     """Collect album items and deliver each group after a quiet interval."""
 
