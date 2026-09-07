@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 
 from app.config import load_config
 from app.handlers import create_router
+from app.media_group import MediaGroupCollector
 
 
 async def main() -> None:
@@ -14,12 +15,14 @@ async def main() -> None:
     config = load_config()
     bot = Bot(token=config.bot_token)
     dispatcher = Dispatcher()
-    dispatcher.include_router(create_router(config.owner_user_id))
+    collector = MediaGroupCollector(config.media_group_debounce_seconds)
+    dispatcher.include_router(create_router(config.owner_user_id, collector))
 
     try:
         logging.info("Bot started")
         await dispatcher.start_polling(bot)
     finally:
+        await collector.close()
         await bot.session.close()
         logging.info("Bot stopped")
 
