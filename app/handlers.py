@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable, Sequence
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
@@ -9,7 +10,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.config import GoogleConfig
 from app.document_builder import DocumentImageError
-from app.google_drive import GoogleAuthError, archive_forwarded_post
+from app.google_drive import (DriveDocument, GoogleAuthError,
+                              archive_forwarded_post,
+                              find_existing_archived_post)
 from app.media_group import MediaGroupCollector, is_photo_album
 from app.telegram_media import (DownloadedPhoto, TelegramMediaError,
                                 download_message_photo)
@@ -64,6 +67,34 @@ GOOGLE_ERROR_MESSAGE = (
     "Подробности записаны в журнал."
 )
 
+PhotoDownloader = Callable[[], Awaitable[Sequence[DownloadedPhoto]]]
+
+
+async def _archive_with_deduplication(
+    post: ForwardedPost,
+    google_config: GoogleConfig,
+    archive_lock: asyncio.Lock,
+    download_photos: PhotoDownloader,
+) -> tuple[DriveDocument, bool, Sequence[DownloadedPhoto]]:
+    """Serialize lookup, media download, and upload for one post."""
+    async with archive_lock:
+        existing = await asyncio.to_thread(
+            find_existing_archived_post,
+            post,
+            google_config,
+        )
+        if existing is not None:
+            return existing, True, ()
+
+        photos = await download_photos()
+        document = await asyncio.to_thread(
+            archive_forwarded_post,
+            post,
+            google_config,
+            photos,
+        )
+        return document, False, photos
+
 
 def _format_forwarded_post(post: ForwardedPost) -> str:
     """Build a short diagnostic response for a forwarded channel post."""
@@ -115,6 +146,7 @@ def create_router(
 ) -> Router:
     """Create a router whose private handlers belong to one Telegram user."""
     router = Router()
+    archive_lock = asyncio.Lock()
 
     @router.message(CommandStart(), F.from_user.id == owner_user_id)
     async def handle_start(message: Message) -> None:
@@ -146,24 +178,27 @@ def create_router(
             status = await messages[0].answer(
                 f"⏳ Сохраняю альбом из {len(messages)} фото…"
             )
-            photos: list[DownloadedPhoto] = []
-            try:
+            async def download_photos() -> Sequence[DownloadedPhoto]:
+                photos: list[DownloadedPhoto] = []
                 for item in messages:
                     photos.append(
                         await download_message_photo(item.bot, item)
                     )
+                return photos
+
+            try:
+                document, duplicate, photos = (
+                    await _archive_with_deduplication(
+                        post,
+                        google_config,
+                        archive_lock,
+                        download_photos,
+                    )
+                )
             except TelegramMediaError:
                 logger.exception("Could not download Telegram photo album")
                 await status.edit_text(ALBUM_DOWNLOAD_ERROR_MESSAGE)
                 return
-
-            try:
-                document = await asyncio.to_thread(
-                    archive_forwarded_post,
-                    post,
-                    google_config,
-                    photos,
-                )
             except GoogleAuthError:
                 await status.edit_text(GOOGLE_AUTH_MESSAGE)
                 return
@@ -174,6 +209,13 @@ def create_router(
             except Exception:
                 logger.exception("Could not archive Telegram photo album")
                 await status.edit_text(GOOGLE_ERROR_MESSAGE)
+                return
+
+            if duplicate:
+                await status.edit_text(
+                    "♻️ Уже сохранено\n\n" f"📄 {document.name}",
+                    reply_markup=_document_keyboard(document.web_url),
+                )
                 return
 
             logger.info(
@@ -213,27 +255,26 @@ def create_router(
             await message.answer(_format_forwarded_post(post))
             return
 
-        photos: list[DownloadedPhoto] = []
+        async def download_photos() -> Sequence[DownloadedPhoto]:
+            if not post.photo_count:
+                return ()
+            return (await download_message_photo(message.bot, message),)
+
         if post.photo_count:
-            status = await message.answer("⏳ Загружаю изображение…")
-            try:
-                photos.append(
-                    await download_message_photo(message.bot, message)
-                )
-            except TelegramMediaError:
-                logger.exception("Could not download Telegram post photo")
-                await status.edit_text(PHOTO_DOWNLOAD_ERROR_MESSAGE)
-                return
-            await status.edit_text("⏳ Сохраняю в Google Drive…")
+            status = await message.answer("⏳ Проверяю Google Drive…")
         else:
             status = await message.answer("⏳ Сохраняю в Google Drive…")
         try:
-            document = await asyncio.to_thread(
-                archive_forwarded_post,
+            document, duplicate, photos = await _archive_with_deduplication(
                 post,
                 google_config,
-                photos,
+                archive_lock,
+                download_photos,
             )
+        except TelegramMediaError:
+            logger.exception("Could not download Telegram post photo")
+            await status.edit_text(PHOTO_DOWNLOAD_ERROR_MESSAGE)
+            return
         except GoogleAuthError:
             await status.edit_text(GOOGLE_AUTH_MESSAGE)
             return
@@ -244,6 +285,13 @@ def create_router(
         except Exception:
             logger.exception("Could not archive forwarded Telegram post")
             await status.edit_text(GOOGLE_ERROR_MESSAGE)
+            return
+
+        if duplicate:
+            await status.edit_text(
+                "♻️ Уже сохранено\n\n" f"📄 {document.name}",
+                reply_markup=_document_keyboard(document.web_url),
+            )
             return
 
         channel_title = post.source_chat_title or "недоступен"

@@ -253,6 +253,92 @@ def create_google_document(
     )
 
 
+def find_archived_document(
+    drive_service: Any,
+    source_chat_id: int,
+    source_message_id: int,
+) -> DriveDocument | None:
+    """Find the oldest active document for one Telegram source post."""
+    query = (
+        "trashed = false and "
+        f"mimeType = '{GOOGLE_DOC_MIME_TYPE}' and "
+        "appProperties has { key='application' and "
+        "value='telegram_archive_bot' } and "
+        "appProperties has { key='purpose' and "
+        "value='archived_post' } and "
+        "appProperties has { key='source_chat_id' and "
+        f"value='{source_chat_id}' }} and "
+        "appProperties has { key='source_message_id' and "
+        f"value='{source_message_id}' }}"
+    )
+    documents: list[dict[str, str]] = []
+    page_token: str | None = None
+
+    while True:
+        response = (
+            drive_service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="nextPageToken, files(id, name, createdTime)",
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        documents.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    if not documents:
+        return None
+
+    documents.sort(
+        key=lambda document: (
+            document.get("createdTime", ""),
+            document["id"],
+        )
+    )
+    if len(documents) > 1:
+        logger.warning(
+            "Multiple archived documents found for Telegram source: "
+            "chat_id=%s, message_id=%s",
+            source_chat_id,
+            source_message_id,
+        )
+
+    document = documents[0]
+    document_id = document["id"]
+    return DriveDocument(
+        id=document_id,
+        name=document["name"],
+        web_url=(
+            f"https://docs.google.com/document/d/{document_id}/edit"
+        ),
+    )
+
+
+def find_existing_archived_post(
+    post: ForwardedPost,
+    google_config: GoogleConfig,
+) -> DriveDocument | None:
+    """Find a post by stable Telegram coordinates when both are known."""
+    if post.source_chat_id is None or post.source_message_id is None:
+        return None
+
+    credentials = get_google_credentials(
+        google_config.credentials_path,
+        google_config.token_path,
+        allow_interactive=False,
+    )
+    drive_service = build_drive_service(credentials)
+    return find_archived_document(
+        drive_service,
+        post.source_chat_id,
+        post.source_message_id,
+    )
+
+
 def archive_forwarded_post(
     post: ForwardedPost,
     google_config: GoogleConfig,
@@ -279,8 +365,7 @@ def archive_forwarded_post(
         properties["source_message_id"] = str(post.source_message_id)
     if post.media_group_id is not None:
         properties["media_group_id"] = str(post.media_group_id)
-    if photos:
-        properties["photo_count"] = str(len(photos))
+    properties["photo_count"] = str(post.photo_count)
 
     return create_google_document(
         drive_service,
