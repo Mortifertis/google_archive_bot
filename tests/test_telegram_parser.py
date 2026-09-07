@@ -72,8 +72,18 @@ def test_single_photo_is_counted_once() -> None:
     payload.pop("text")
     payload["caption"] = "Photo caption"
     payload["photo"] = [
-        {"file_id": "small", "file_unique_id": "same"},
-        {"file_id": "large", "file_unique_id": "same"},
+        {
+            "file_id": "small",
+            "file_unique_id": "same",
+            "width": 320,
+            "height": 240,
+        },
+        {
+            "file_id": "large",
+            "file_unique_id": "same",
+            "width": 800,
+            "height": 600,
+        },
     ]
 
     post = parse_forwarded_post(Message.model_validate(payload))

@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +11,21 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+from app.config import GoogleConfig
+from app.document_builder import build_document_title, build_post_docx
+from app.telegram_parser import ForwardedPost
 
 GOOGLE_DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+DOCX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "wordprocessingml.document"
+)
 ARCHIVE_APP_PROPERTIES = {
     "application": "telegram_archive_bot",
     "purpose": "archive_root",
@@ -36,6 +47,15 @@ class DriveFolder:
     web_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class DriveDocument:
+    """A native Google document created by the application."""
+
+    id: str
+    name: str
+    web_url: str
+
+
 def _save_credentials(credentials: Credentials, token_path: Path) -> None:
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(credentials.to_json(), encoding="utf-8")
@@ -44,6 +64,8 @@ def _save_credentials(credentials: Credentials, token_path: Path) -> None:
 def get_google_credentials(
     credentials_path: str,
     token_path: str,
+    *,
+    allow_interactive: bool = True,
 ) -> Credentials:
     """Load, refresh, or interactively obtain Google user credentials."""
     client_file = Path(credentials_path).expanduser()
@@ -75,6 +97,12 @@ def get_google_credentials(
             _save_credentials(credentials, token_file)
             logger.info("Google OAuth token refreshed")
             return credentials
+
+    if not allow_interactive:
+        raise GoogleAuthError(
+            "Google Drive is not authorized.\n"
+            "Run: python -m app.google_auth"
+        )
 
     if not client_file.is_file():
         raise GoogleAuthError(
@@ -136,12 +164,16 @@ def ensure_archive_folder(
     page_token: str | None = None
 
     while True:
-        response = drive_service.files().list(
-            q=query,
-            spaces="drive",
-            fields="nextPageToken, files(id, name, createdTime)",
-            pageToken=page_token,
-        ).execute()
+        response = (
+            drive_service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="nextPageToken, files(id, name, createdTime)",
+                pageToken=page_token,
+            )
+            .execute()
+        )
         folders.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -162,14 +194,93 @@ def ensure_archive_folder(
         logger.info("Archive folder found: %s", folder.id)
         return folder
 
-    created = drive_service.files().create(
-        body={
-            "name": folder_name,
-            "mimeType": FOLDER_MIME_TYPE,
-            "appProperties": ARCHIVE_APP_PROPERTIES,
-        },
-        fields="id, name",
-    ).execute()
+    created = (
+        drive_service.files()
+        .create(
+            body={
+                "name": folder_name,
+                "mimeType": FOLDER_MIME_TYPE,
+                "appProperties": ARCHIVE_APP_PROPERTIES,
+            },
+            fields="id, name",
+        )
+        .execute()
+    )
     folder = _to_drive_folder(created)
     logger.info("Archive folder created: %s", folder.id)
     return folder
+
+
+def create_google_document(
+    drive_service: Any,
+    archive_folder_id: str,
+    title: str,
+    docx_stream: BytesIO,
+    app_properties: dict[str, str] | None = None,
+) -> DriveDocument:
+    """Upload DOCX content and import it as a native Google document."""
+    docx_stream.seek(0)
+    body: dict[str, Any] = {
+        "name": title,
+        "mimeType": GOOGLE_DOC_MIME_TYPE,
+        "parents": [archive_folder_id],
+    }
+    if app_properties:
+        body["appProperties"] = {
+            key: str(value) for key, value in app_properties.items()
+        }
+    media = MediaIoBaseUpload(
+        docx_stream,
+        mimetype=DOCX_MIME_TYPE,
+        resumable=False,
+    )
+    created = (
+        drive_service.files()
+        .create(
+            body=body,
+            media_body=media,
+            fields="id, name",
+        )
+        .execute()
+    )
+    file_id = created["id"]
+    return DriveDocument(
+        id=file_id,
+        name=created["name"],
+        web_url=f"https://docs.google.com/document/d/{file_id}/edit",
+    )
+
+
+def archive_forwarded_post(
+    post: ForwardedPost,
+    google_config: GoogleConfig,
+) -> DriveDocument:
+    """Synchronously archive one post using a fresh Drive service."""
+    credentials = get_google_credentials(
+        google_config.credentials_path,
+        google_config.token_path,
+        allow_interactive=False,
+    )
+    drive_service = build_drive_service(credentials)
+    folder = ensure_archive_folder(
+        drive_service,
+        google_config.archive_folder_name,
+    )
+    properties = {
+        "application": "telegram_archive_bot",
+        "purpose": "archived_post",
+    }
+    if post.source_chat_id is not None:
+        properties["source_chat_id"] = str(post.source_chat_id)
+    if post.source_message_id is not None:
+        properties["source_message_id"] = str(post.source_message_id)
+    if post.media_group_id is not None:
+        properties["media_group_id"] = str(post.media_group_id)
+
+    return create_google_document(
+        drive_service,
+        folder.id,
+        build_document_title(post),
+        build_post_docx(post),
+        properties,
+    )

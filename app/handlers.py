@@ -1,25 +1,31 @@
 """Telegram message handlers."""
 
+import asyncio
 import logging
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.config import GoogleConfig
+from app.google_drive import GoogleAuthError, archive_forwarded_post
 from app.media_group import MediaGroupCollector
-from app.telegram_parser import (ForwardedPost, parse_forwarded_messages,
-                                 parse_forwarded_post)
+from app.telegram_parser import (
+    ForwardedPost,
+    parse_forwarded_messages,
+    parse_forwarded_post,
+)
 
 logger = logging.getLogger(__name__)
 
 START_MESSAGE = (
     "Telegram Archive Bot работает.\n\n"
-    "Перешли сюда пост из Telegram-канала. На следующих этапах бот будет "
-    "сохранять такие сообщения в Google Drive."
+    "Перешли сюда текстовый пост из Telegram-канала — я сохраню "
+    "его в Google Drive как Google Doc.\n\n"
+    "Посты с изображениями добавим следующим этапом."
 )
 RECEIVED_MESSAGE = (
-    "Сообщение получено.\n"
-    "Для архивации перешли пост из Telegram-канала."
+    "Сообщение получено.\n" "Для архивации перешли пост из Telegram-канала."
 )
 PRIVATE_MESSAGE = "Этот бот является приватным."
 UNSUPPORTED_FORWARD_MESSAGE = (
@@ -29,6 +35,21 @@ UNSUPPORTED_FORWARD_MESSAGE = (
 UNSUPPORTED_ALBUM_MESSAGE = (
     "Получен альбом, но сейчас поддерживаются только пересланные "
     "публикации из Telegram-каналов."
+)
+PHOTO_MESSAGE = (
+    "Пост распознан, но содержит изображение.\n\n"
+    "Сохранение постов с изображениями будет добавлено на следующем "
+    "этапе."
+)
+GOOGLE_AUTH_MESSAGE = (
+    "❌ Google Drive не настроен.\n\n"
+    "Выполни на компьютере:\n"
+    "python -m app.google_auth\n\n"
+    "и затем повтори отправку поста."
+)
+GOOGLE_ERROR_MESSAGE = (
+    "❌ Не удалось сохранить пост в Google Drive.\n\n"
+    "Подробности записаны в журнал."
 )
 
 
@@ -65,6 +86,7 @@ def _format_forwarded_post(post: ForwardedPost) -> str:
 def create_router(
     owner_user_id: int,
     media_group_collector: MediaGroupCollector,
+    google_config: GoogleConfig,
 ) -> Router:
     """Create a router whose private handlers belong to one Telegram user."""
     router = Router()
@@ -92,7 +114,14 @@ def create_router(
             if post is None or not post.is_channel_post:
                 await messages[0].answer(UNSUPPORTED_ALBUM_MESSAGE)
                 return
-            await messages[0].answer(_format_forwarded_post(post))
+            if post.photo_count:
+                await messages[0].answer(
+                    f"Альбом распознан: {post.photo_count} фото.\n\n"
+                    "Сохранение постов с изображениями будет добавлено "
+                    "на следующем этапе."
+                )
+                return
+            await messages[0].answer(UNSUPPORTED_ALBUM_MESSAGE)
 
         await media_group_collector.add(message, process_album)
 
@@ -110,7 +139,43 @@ def create_router(
             post.source_message_id,
             post.media_group_id,
         )
-        await message.answer(_format_forwarded_post(post))
+        if post.photo_count:
+            await message.answer(PHOTO_MESSAGE)
+            return
+        if message.content_type != "text" or not (post.text or post.caption):
+            await message.answer(_format_forwarded_post(post))
+            return
+
+        status = await message.answer("⏳ Сохраняю в Google Drive…")
+        try:
+            document = await asyncio.to_thread(
+                archive_forwarded_post,
+                post,
+                google_config,
+            )
+        except GoogleAuthError:
+            await status.edit_text(GOOGLE_AUTH_MESSAGE)
+            return
+        except Exception:
+            logger.exception("Could not archive forwarded Telegram post")
+            await status.edit_text(GOOGLE_ERROR_MESSAGE)
+            return
+
+        channel_title = post.source_chat_title or "недоступен"
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Открыть Google Doc",
+                        url=document.web_url,
+                    )
+                ]
+            ]
+        )
+        await status.edit_text(
+            "✅ Сохранено\n\n" f"📄 {document.name}\n" f"📢 {channel_title}",
+            reply_markup=keyboard,
+        )
 
     @router.message(F.from_user.id == owner_user_id)
     async def handle_owner_message(message: Message) -> None:

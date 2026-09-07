@@ -50,7 +50,12 @@ def _message(
     }
     if photo:
         payload["photo"] = [
-            {"file_id": f"photo-{message_id}", "file_unique_id": "unique"}
+            {
+                "file_id": f"photo-{message_id}",
+                "file_unique_id": "unique",
+                "width": 800,
+                "height": 600,
+            }
         ]
     if caption is not None:
         payload["caption"] = caption
