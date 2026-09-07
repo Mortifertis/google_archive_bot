@@ -2,8 +2,11 @@
 
 from unittest.mock import MagicMock
 
-from app.google_drive import (ARCHIVE_APP_PROPERTIES, FOLDER_MIME_TYPE,
-                              ensure_archive_folder)
+from app.google_drive import (
+    ARCHIVE_APP_PROPERTIES,
+    FOLDER_MIME_TYPE,
+    ensure_archive_folder,
+)
 
 
 def _drive_service(list_responses: list[dict[str, object]]) -> MagicMock:
@@ -108,3 +111,53 @@ def test_oldest_duplicate_archive_folder_is_selected() -> None:
     folder = ensure_archive_folder(service, "Telegram Archive")
 
     assert folder.id == "older"
+
+
+def test_google_document_is_imported_with_metadata() -> None:
+    from io import BytesIO
+
+    from app.google_drive import (
+        DOCX_MIME_TYPE,
+        GOOGLE_DOC_MIME_TYPE,
+        create_google_document,
+    )
+
+    service = MagicMock()
+    service.files.return_value.create.return_value.execute.return_value = {
+        "id": "document-id",
+        "name": "Document title",
+    }
+
+    document = create_google_document(
+        service,
+        "folder-id",
+        "Document title",
+        BytesIO(b"docx bytes"),
+        {
+            "application": "telegram_archive_bot",
+            "purpose": "archived_post",
+            "source_chat_id": "-1001",
+            "source_message_id": "42",
+        },
+    )
+
+    create_call = service.files.return_value.create
+    create_call.assert_called_once()
+    call = create_call.call_args.kwargs
+    assert call["body"] == {
+        "name": "Document title",
+        "mimeType": GOOGLE_DOC_MIME_TYPE,
+        "parents": ["folder-id"],
+        "appProperties": {
+            "application": "telegram_archive_bot",
+            "purpose": "archived_post",
+            "source_chat_id": "-1001",
+            "source_message_id": "42",
+        },
+    }
+    assert call["media_body"]._mimetype == DOCX_MIME_TYPE
+    assert call["media_body"]._resumable is False
+    assert call["fields"] == "id, name"
+    assert document.web_url == (
+        "https://docs.google.com/document/d/document-id/edit"
+    )
