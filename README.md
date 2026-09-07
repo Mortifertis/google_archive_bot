@@ -7,7 +7,10 @@
 - сохраняет text-only posts, одиночные фотографии и фото с caption;
 - сохраняет pure photo albums, включая альбомы с caption;
 - импортирует DOCX как native Google Docs;
-- возвращает владельцу ссылку на созданный документ.
+- возвращает владельцу ссылку на созданный документ;
+- при повторной пересылке находит документ по Telegram source metadata и
+  возвращает ссылку, не создавая новый Google Doc и не используя локальную
+  базу данных.
 
 ## Требования
 
@@ -119,4 +122,5 @@ GOOGLE_ARCHIVE_FOLDER_NAME=Telegram Archive
 
 Не поддерживаются видео, аудио, animation/GIF, stickers, произвольные документы
 и mixed-media albums. Telegram может не разрешить скачать защищённый контент
-или файл, недоступный боту через Bot API. Deduplication отсутствует.
+или файл, недоступный боту через Bot API. Deduplication возможно только при
+наличии `source_chat_id` и `source_message_id` в Telegram metadata.
