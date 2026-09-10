@@ -16,6 +16,21 @@ def is_photo_album(messages: list[Message]) -> bool:
     return bool(messages) and all(bool(message.photo) for message in messages)
 
 
+def is_supported_media_group(messages: list[Message]) -> bool:
+    """Return whether every item has exactly one supported media type."""
+    return bool(messages) and all(
+        sum(
+            (
+                bool(message.photo),
+                message.video is not None,
+                message.animation is not None,
+            )
+        )
+        == 1
+        for message in messages
+    )
+
+
 class MediaGroupCollector:
     """Collect album items and deliver each group after a quiet interval."""
 
