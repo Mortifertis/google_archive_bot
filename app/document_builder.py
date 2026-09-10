@@ -8,11 +8,13 @@ from docx import Document
 from docx.document import Document as DocumentType
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-from app.telegram_media import DownloadedPhoto
+from app.telegram_media import (TELEGRAM_DOWNLOAD_LIMIT_REASON, ArchivedMedia,
+                                DownloadedMedia, DownloadedPhoto)
 from app.telegram_parser import ForwardedPost
 
 MAX_TITLE_LENGTH = 150
@@ -177,9 +179,127 @@ def _configure_cell(cell: object) -> None:
     paragraph.paragraph_format.space_before = Pt(0)
 
 
+def format_duration(seconds: int | None) -> str | None:
+    """Format a Telegram duration without external dependencies."""
+    if seconds is None:
+        return None
+    hours, remainder = divmod(max(0, seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_file_size(size: int | None) -> str | None:
+    """Format byte size in compact decimal/binary-friendly units."""
+    if size is None:
+        return None
+    if size < 1024 * 1024:
+        return f"{size / 1000:.0f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _add_hyperlink(paragraph: object, text: str, url: str) -> None:
+    relationship = paragraph.part.relate_to(
+        url,
+        RELATIONSHIP_TYPE.HYPERLINK,
+        is_external=True,
+    )
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relationship)
+    run = OxmlElement("w:r")
+    properties = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "3A5370")
+    properties.append(color)
+    size = OxmlElement("w:sz")
+    size.set(qn("w:val"), "18")
+    properties.append(size)
+    run.append(properties)
+    value = OxmlElement("w:t")
+    value.text = text
+    run.append(value)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
+def _as_archived_media(item: object) -> ArchivedMedia:
+    if isinstance(item, ArchivedMedia):
+        return item
+    if isinstance(item, DownloadedMedia):
+        return ArchivedMedia(
+            kind=item.kind,
+            preview_data=(
+                item.data if item.kind == "photo" else item.preview_data
+            ),
+            width=item.width,
+            height=item.height,
+            duration=item.duration,
+            file_size=item.file_size,
+            mime_type=item.mime_type,
+            unavailable_reason=item.unavailable_reason,
+        )
+    photo = item
+    return ArchivedMedia(
+        kind="photo",
+        preview_data=photo.data,
+        width=photo.width,
+        height=photo.height,
+        duration=None,
+        file_size=None,
+    )
+
+
+def _add_media_cell(cell: object, media: ArchivedMedia, width: object) -> None:
+    _configure_cell(cell)
+    paragraph = cell.paragraphs[0]
+    if media.preview_data:
+        run = paragraph.add_run()
+        run.add_picture(BytesIO(media.preview_data), width=width)
+    if media.kind == "photo":
+        return
+
+    label = "GIF" if media.mime_type == "image/gif" else {
+        "video": "Видео",
+        "animation": "Анимация",
+    }[media.kind]
+    details = [
+        format_duration(media.duration),
+        format_file_size(media.file_size),
+    ]
+    details = [value for value in details if value]
+    line = f"▶ {label}"
+    if details:
+        line += " · " + " · ".join(details)
+    metadata = cell.add_paragraph()
+    metadata.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    metadata.paragraph_format.space_after = Pt(2)
+    run = metadata.add_run(line)
+    _set_run_font(run, Pt(9))
+    run.bold = True
+    run.font.color.rgb = RGBColor(68, 68, 68)
+    if media.drive_web_url:
+        link = cell.add_paragraph()
+        link.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        noun = "видео" if media.kind == "video" else "анимацию"
+        _add_hyperlink(
+            link,
+            f"Открыть {noun} в Google Drive",
+            media.drive_web_url,
+        )
+    elif media.unavailable_reason == TELEGRAM_DOWNLOAD_LIMIT_REASON:
+        warning = cell.add_paragraph()
+        warning.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = warning.add_run(
+            "Файл не архивирован: превышает лимит Telegram Bot API 20 MB."
+        )
+        _set_run_font(run, Pt(8))
+        run.font.color.rgb = RGBColor(126, 74, 74)
+
+
 def _add_gallery(
     document: DocumentType,
-    photos: Sequence[DownloadedPhoto],
+    items: Sequence[object],
 ) -> None:
     section = document.sections[0]
     available_width = (
@@ -193,23 +313,21 @@ def _add_gallery(
     image_width = column_width - Cm(0.12)
 
     try:
-        for index in range(0, len(photos), 2):
+        media_items = [_as_archived_media(item) for item in items]
+        for index in range(0, len(media_items), 2):
             row = table.add_row()
-            pair = photos[index:index + 2]
+            pair = media_items[index:index + 2]
             if len(pair) == 1:
                 cell = row.cells[0].merge(row.cells[1])
-                _configure_cell(cell)
-                run = cell.paragraphs[0].add_run()
-                run.add_picture(
-                    BytesIO(pair[0].data),
-                    width=available_width - Cm(0.15),
+                _add_media_cell(
+                    cell,
+                    pair[0],
+                    available_width - Cm(0.15),
                 )
                 continue
-            for cell, photo in zip(row.cells, pair):
+            for cell, media in zip(row.cells, pair):
                 cell.width = column_width
-                _configure_cell(cell)
-                run = cell.paragraphs[0].add_run()
-                run.add_picture(BytesIO(photo.data), width=image_width)
+                _add_media_cell(cell, media, image_width)
     except Exception as error:
         raise DocumentImageError(
             "Could not embed a Telegram photo in DOCX"
@@ -264,9 +382,9 @@ def _add_footer(document: DocumentType) -> None:
 
 def build_post_docx(
     post: ForwardedPost,
-    photos: Sequence[DownloadedPhoto] = (),
+    photos: Sequence[DownloadedPhoto | DownloadedMedia | ArchivedMedia] = (),
 ) -> BytesIO:
-    """Return a seekable DOCX stream containing post text and photos."""
+    """Return a seekable DOCX stream containing post text and media."""
     document = Document()
     _configure_document(document)
     content = _post_content(post)

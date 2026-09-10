@@ -13,9 +13,9 @@ from app.document_builder import DocumentImageError
 from app.google_drive import (DriveDocument, GoogleAuthError,
                               archive_forwarded_post,
                               find_existing_archived_post)
-from app.media_group import MediaGroupCollector, is_photo_album
-from app.telegram_media import (DownloadedPhoto, TelegramMediaError,
-                                download_message_photo)
+from app.media_group import MediaGroupCollector, is_supported_media_group
+from app.telegram_media import (DownloadedMedia, TelegramMediaError,
+                                download_message_media)
 from app.telegram_parser import (ForwardedPost, parse_forwarded_messages,
                                  parse_forwarded_post)
 
@@ -25,7 +25,8 @@ START_MESSAGE = (
     "Telegram Archive Bot работает.\n\n"
     "Перешли сюда пост из Telegram-канала — я сохраню "
     "его в Google Drive как Google Doc.\n\n"
-    "Поддерживаются текст, фотографии и фотоальбомы."
+    "Поддерживаются текст, фотографии, видео, GIF/анимации, "
+    "фотоальбомы и смешанные фото/видео альбомы."
 )
 RECEIVED_MESSAGE = (
     "Сообщение получено.\n" "Для архивации перешли пост из Telegram-канала."
@@ -39,11 +40,7 @@ UNSUPPORTED_ALBUM_MESSAGE = (
     "Получен альбом, но сейчас поддерживаются только пересланные "
     "публикации из Telegram-каналов."
 )
-MIXED_ALBUM_MESSAGE = (
-    "Альбом содержит неподдерживаемые типы медиа.\n\n"
-    "Сейчас можно сохранять только альбомы, состоящие полностью из "
-    "фотографий."
-)
+MIXED_ALBUM_MESSAGE = "Альбом содержит неподдерживаемый тип медиа."
 PHOTO_DOWNLOAD_ERROR_MESSAGE = (
     "❌ Не удалось скачать изображение из публикации.\n\n"
     "Попробуй переслать публикацию ещё раз."
@@ -67,15 +64,15 @@ GOOGLE_ERROR_MESSAGE = (
     "Подробности записаны в журнал."
 )
 
-PhotoDownloader = Callable[[], Awaitable[Sequence[DownloadedPhoto]]]
+MediaDownloader = Callable[[], Awaitable[Sequence[DownloadedMedia]]]
 
 
 async def _archive_with_deduplication(
     post: ForwardedPost,
     google_config: GoogleConfig,
     archive_lock: asyncio.Lock,
-    download_photos: PhotoDownloader,
-) -> tuple[DriveDocument, bool, Sequence[DownloadedPhoto]]:
+    download_media: MediaDownloader,
+) -> tuple[DriveDocument, bool, Sequence[DownloadedMedia]]:
     """Serialize lookup, media download, and upload for one post."""
     async with archive_lock:
         existing = await asyncio.to_thread(
@@ -86,14 +83,14 @@ async def _archive_with_deduplication(
         if existing is not None:
             return existing, True, ()
 
-        photos = await download_photos()
+        media = await download_media()
         document = await asyncio.to_thread(
             archive_forwarded_post,
             post,
             google_config,
-            photos,
+            media,
         )
-        return document, False, photos
+        return document, False, media
 
 
 def _format_forwarded_post(post: ForwardedPost) -> str:
@@ -121,6 +118,8 @@ def _format_forwarded_post(post: ForwardedPost) -> str:
             f"Ссылка: {post.source_url or 'недоступна'}",
             f"Текст: {'есть' if has_text else 'нет'}",
             f"Фото: {post.photo_count}",
+            f"Видео: {post.video_count}",
+            f"Анимации: {post.animation_count}",
             f"Media group: {post.media_group_id or 'нет'}",
         )
     )
@@ -137,6 +136,27 @@ def _document_keyboard(web_url: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def _format_media_statistics(
+    post: ForwardedPost,
+    media: Sequence[DownloadedMedia],
+) -> str:
+    """Build non-empty media counters and graceful-limit diagnostics."""
+    lines = []
+    if post.photo_count:
+        lines.append(f"🖼 Фото: {post.photo_count}")
+    if post.video_count:
+        lines.append(f"🎬 Видео: {post.video_count}")
+    if post.animation_count:
+        lines.append(f"🎞 Анимации: {post.animation_count}")
+    unavailable = sum(bool(item.unavailable_reason) for item in media)
+    if unavailable:
+        lines.append(
+            f"⚠️ {unavailable} медиафайл не архивирован из-за лимита "
+            "Telegram."
+        )
+    return "\n" + "\n".join(lines) if lines else ""
 
 
 def create_router(
@@ -171,28 +191,28 @@ def create_router(
             if post is None or not post.is_channel_post:
                 await messages[0].answer(UNSUPPORTED_ALBUM_MESSAGE)
                 return
-            if not is_photo_album(messages):
+            if not is_supported_media_group(messages):
                 await messages[0].answer(MIXED_ALBUM_MESSAGE)
                 return
 
             status = await messages[0].answer(
-                f"⏳ Сохраняю альбом из {len(messages)} фото…"
+                f"⏳ Сохраняю альбом из {len(messages)} медиафайлов…"
             )
-            async def download_photos() -> Sequence[DownloadedPhoto]:
-                photos: list[DownloadedPhoto] = []
+            async def download_media() -> Sequence[DownloadedMedia]:
+                media: list[DownloadedMedia] = []
                 for item in messages:
-                    photos.append(
-                        await download_message_photo(item.bot, item)
+                    media.append(
+                        await download_message_media(item.bot, item)
                     )
-                return photos
+                return media
 
             try:
-                document, duplicate, photos = (
+                document, duplicate, media = (
                     await _archive_with_deduplication(
                         post,
                         google_config,
                         archive_lock,
-                        download_photos,
+                        download_media,
                     )
                 )
             except TelegramMediaError:
@@ -222,14 +242,14 @@ def create_router(
                 "Telegram photo album archived: media_group_id=%s, "
                 "photos=%s",
                 post.media_group_id,
-                len(photos),
+                post.photo_count,
             )
             channel_title = post.source_chat_title or "недоступен"
             await status.edit_text(
                 "✅ Сохранено\n\n"
                 f"📄 {document.name}\n"
                 f"📢 {channel_title}\n"
-                f"🖼 Фото: {len(photos)}",
+                + _format_media_statistics(post, media),
                 reply_markup=_document_keyboard(document.web_url),
             )
 
@@ -249,27 +269,27 @@ def create_router(
             post.source_message_id,
             post.media_group_id,
         )
-        if not post.photo_count and (
+        if not post.media_count and (
             message.content_type != "text" or not post.text
         ):
             await message.answer(_format_forwarded_post(post))
             return
 
-        async def download_photos() -> Sequence[DownloadedPhoto]:
-            if not post.photo_count:
+        async def download_media() -> Sequence[DownloadedMedia]:
+            if not post.media_count:
                 return ()
-            return (await download_message_photo(message.bot, message),)
+            return (await download_message_media(message.bot, message),)
 
         if post.photo_count:
             status = await message.answer("⏳ Проверяю Google Drive…")
         else:
             status = await message.answer("⏳ Сохраняю в Google Drive…")
         try:
-            document, duplicate, photos = await _archive_with_deduplication(
+            document, duplicate, media = await _archive_with_deduplication(
                 post,
                 google_config,
                 archive_lock,
-                download_photos,
+                download_media,
             )
         except TelegramMediaError:
             logger.exception("Could not download Telegram post photo")
@@ -298,10 +318,13 @@ def create_router(
         logger.info(
             "Forwarded Telegram post archived: message_id=%s, photos=%s",
             post.source_message_id,
-            len(photos),
+            post.photo_count,
         )
         await status.edit_text(
-            "✅ Сохранено\n\n" f"📄 {document.name}\n" f"📢 {channel_title}",
+            "✅ Сохранено\n\n"
+            f"📄 {document.name}\n"
+            f"📢 {channel_title}"
+            + _format_media_statistics(post, media),
             reply_markup=_document_keyboard(document.web_url),
         )
 

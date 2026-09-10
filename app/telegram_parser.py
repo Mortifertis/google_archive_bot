@@ -22,6 +22,9 @@ class ForwardedPost:
     media_group_id: str | None
     photo_count: int
     is_channel_post: bool
+    video_count: int = 0
+    animation_count: int = 0
+    media_count: int = 0
 
 
 def parse_forwarded_post(message: Message) -> ForwardedPost | None:
@@ -94,6 +97,11 @@ def parse_forwarded_messages(
         None,
     )
 
+    photo_count = sum(bool(message.photo) for message in ordered_messages)
+    video_count = sum(bool(message.video) for message in ordered_messages)
+    animation_count = sum(
+        bool(message.animation) for message in ordered_messages
+    )
     return ForwardedPost(
         source_chat_id=source_chat_id,
         source_chat_title=source_chat_title,
@@ -104,6 +112,9 @@ def parse_forwarded_messages(
         text=content,
         caption=caption,
         media_group_id=media_group_id,
-        photo_count=sum(bool(message.photo) for message in ordered_messages),
+        photo_count=photo_count,
+        video_count=video_count,
+        animation_count=animation_count,
+        media_count=photo_count + video_count + animation_count,
         is_channel_post=is_channel_post,
     )
